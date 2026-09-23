@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .merger import Merger, parse_pointer
+from .merger import MISSING, Merger, make_patch, parse_pointer
 from .middleware import RequestSizeLimitMiddleware
 from .models import (
     Conflict,
@@ -40,9 +40,13 @@ app = FastAPI(
         "produced it, and whether it was deleted; records are sorted by "
         "final JSON Pointer (deleted items keep their original pointer). "
         "Without redaction the response conflicts always keep the original "
-        "three-way values."
+        "three-way values. With 'includePatch' the response additionally "
+        "carries a 'patch' array: an RFC 6902 JSON Patch whose ordered "
+        "operations turn the request 'base' into 'merged' (objects diffed "
+        "recursively, arrays replaced wholesale, JSON Pointer tokens "
+        "escaped)."
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -173,13 +177,27 @@ async def merge(request: MergeRequest):
         for record in raw_provenance
     ] if request.include_provenance else None
 
-    # Serialize directly: with provenance disabled the response must be
-    # byte-for-byte the old two-key envelope (no "provenance": null), while
-    # an enabled request always includes the array, even when empty.
+    # Serialize directly: with a toggle disabled the response must be
+    # byte-for-byte the old envelope (no "provenance": null / no "patch":
+    # null -- the keys are absent entirely), while an enabled toggle
+    # always contributes its array, even when empty.
+    body: dict = {
+        "merged": merged,
+        "conflicts": [c.model_dump() for c in conflicts],
+    }
     if request.include_provenance:
-        body = MergeResponse(
-            merged=merged, conflicts=conflicts, provenance=provenance
-        ).model_dump()
-    else:
-        body = {"merged": merged, "conflicts": [c.model_dump() for c in conflicts]}
+        body["provenance"] = [p.model_dump() for p in provenance]
+    if request.include_patch:
+        # An RFC 6902 patch of base -> merged. A 'remove' op carries no
+        # 'value' member at all (the generator tags it with MISSING), so
+        # build each operation dict by hand instead of dumping a model.
+        patch: list[dict] = []
+        for op in make_patch(request.base, merged):
+            entry = {"op": op.op, "path": op.path}
+            if op.value is not MISSING:
+                entry["value"] = op.value
+            patch.append(entry)
+        body["patch"] = patch
+    # Validate the assembled envelope against the response model.
+    MergeResponse(**body)
     return JSONResponse(body)

@@ -259,6 +259,60 @@ curl -s -X POST http://localhost:8000/merge \
 下标 `0`，也显示为 `/servers/0`（`deleted: false`）——两条记录按指针相邻排列。
 被接受的删除同样可以来自裁决（此时 `source` 为裁决方且 `adjudicated: true`）。
 
+### 合并补丁（includePatch）
+
+审阅或回放合并结果时，可能需要一份“从 `base` 到 `merged` 改了什么”的标准补丁。
+请求可携带可选布尔字段 `includePatch`（也接受别名 `include_patch`，默认 `false`）。
+开启后，响应在 `merged` / `conflicts`（以及可选的 `provenance`）之外**新增**一个
+`patch` 数组；不开启时**响应格式完全不变**（不会出现 `"patch": null`，连键都不存在）。
+
+`patch` 是 [RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)
+操作数组，**按顺序应用到请求的 `base` 后，得到的文档与响应 `merged` 完全一致**：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"a": 1, "b": {"x": 1, "y": 2}, "tags": [1, 2], "gone": true, "na~me/b": "v"},
+    "left":  {"a": 9, "b": {"x": 1, "y": 2, "z": 3}, "tags": [1, 2, 3], "na~me/b": "v"},
+    "right": {"a": 1, "b": {"x": 8, "y": 2}, "tags": [1, 2], "na~me/b": "V"},
+    "includePatch": true
+  }'
+```
+
+响应（`/a` 来自 left、`/b/x` 来自 right，`/b/z` 单侧新增，`/gone` 两侧删除，
+普通数组 `/tags` 整体替换；键名中的 `~` / `/` 按 RFC 6901 转义为 `~0` / `~1`）：
+
+```json
+{
+  "merged": {"a": 9, "b": {"x": 8, "y": 2, "z": 3}, "tags": [1, 2, 3], "na~me/b": "V"},
+  "conflicts": [],
+  "patch": [
+    {"op": "replace", "path": "/a", "value": 9},
+    {"op": "replace", "path": "/b/x", "value": 8},
+    {"op": "add", "path": "/b/z", "value": 3},
+    {"op": "remove", "path": "/gone"},
+    {"op": "replace", "path": "/na~0me~1b", "value": "V"},
+    {"op": "replace", "path": "/tags", "value": [1, 2, 3]}
+  ]
+}
+```
+
+生成规则：
+
+| 规则 | 说明 |
+| --- | --- |
+| 操作类型 | 仅使用 `add` / `remove` / `replace`；每个操作含 `op` 与 `path`，`add` / `replace` 另含 `value`，`remove` **不含** `value` 成员（JSON `null` 仍是真实值，照常带 `"value": null`）。 |
+| 对象递归 | 对象差异**逐成员递归**：仅存在于结果中的键 `add`，仅存在于 base 中的键 `remove`，两侧都有但值不同的键 `replace`；整个新增 / 删除的子对象只生成一条 `add` / `remove`，不深入内部。 |
+| 数组整体替换 | 数组（含配置了 `arrayIdentity` 的对象数组）**作为一个整体**生成一条 `replace`，不逐元素 diff——与合并引擎“普通数组是整体值”的语义一致。 |
+| 类型变化 | 对象变为数组 / 标量等类型变化是一条针对该位置的 `replace`；整个根文档变化时 `path` 为空字符串 `""`。 |
+| 指针转义 | 所有 `path` 均为 RFC 6901 JSON Pointer：`~` 写作 `~0`，`/` 写作 `~1`（如上例 `/na~0me~1b` 指向键 `na~me/b`）。 |
+| 顺序与稳定性 | 操作按 `path`（相同再按 `op`）升序排列；补丁路径互不互为祖先，因此任意列出顺序都可安全应用，相同输入输出完全确定。`base` 与 `merged` 相同（或均为空对象）时为 `[]`。 |
+
+补丁纯粹是最终 `base → merged` 的差异，因此自动反映 `conflictResolutions` 裁决与
+`protectedPaths` 冻结的结果；开启 / 关闭 `includePatch` 不改变 `merged` 与 `conflicts`
+（可与 `includeProvenance` 同时开启，两个数组互不影响）。
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -280,7 +334,10 @@ curl -s -X POST http://localhost:8000/merge \
 `protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略；
 `redactPaths`（也接受别名 `redact_paths`）为冲突值脱敏指针数组，可省略；
 `includeProvenance`（也接受别名 `include_provenance`）为布尔值，可省略（默认 `false`），
-开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）。
+开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）；
+`includePatch`（也接受别名 `include_patch`）为布尔值，可省略（默认 `false`），
+开启后响应额外返回 `patch` 数组——按 RFC 6902 表示、顺序应用到 `base` 即得到
+`merged`（见“合并补丁”一节）。两个开关互不影响，可同时开启。
 
 请求：
 

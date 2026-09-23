@@ -1154,6 +1154,297 @@ def test_provenance_entry_shape_is_validated_in_schema():
     assert response_schema["required"] == ["merged", "conflicts"]
 
 
+# --------------------------------------------------------------- includePatch
+
+
+def _rfc6902_apply(document, operations):
+    """Minimal RFC 6902 applier for the shapes the endpoint emits."""
+    from app.merger import parse_pointer
+
+    def index_of(token, length):
+        if token == "-":
+            return length
+        if token == "0" or (
+            token and token[0] in "123456789" and token.isdigit()
+        ):
+            value = int(token)
+            if value <= length:
+                return value
+        raise AssertionError(f"bad array token {token!r}")
+
+    current = document
+    for operation in operations:
+        tokens = parse_pointer(operation["path"])
+        if not tokens:
+            assert operation["op"] in ("add", "replace")
+            current = operation["value"]
+            continue
+        parent = current
+        for token in tokens[:-1]:
+            parent = (
+                parent[token]
+                if isinstance(parent, dict)
+                else parent[index_of(token, len(parent))]
+            )
+        last = tokens[-1]
+        if operation["op"] == "remove":
+            assert "value" not in operation
+            if isinstance(parent, dict):
+                del parent[last]
+            else:
+                del parent[index_of(last, len(parent))]
+        elif isinstance(parent, dict):
+            parent[last] = operation["value"]
+        else:
+            idx = index_of(last, len(parent))
+            if operation["op"] == "add":
+                parent.insert(idx, operation["value"])
+            else:
+                parent[idx] = operation["value"]
+    return current
+
+
+def test_patch_absent_from_response_by_default():
+    response = client.post(
+        "/merge",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1}},
+    )
+    assert response.status_code == 200
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_patch_absent_when_explicitly_false():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "includePatch": False,
+        },
+    )
+    assert response.status_code == 200
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_patch_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "include_patch": True,
+        },
+    )
+    assert response.status_code == 200
+    assert "patch" in response.json()
+
+
+def test_patch_is_empty_when_nothing_changed():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 1}, "right": {"a": 1},
+            "includePatch": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["patch"] == []
+    assert set(body.keys()) == {"merged", "conflicts", "patch"}
+
+
+def test_patch_applied_to_base_yields_merged_for_recursive_object_diff():
+    payload = {
+        "base": {
+            "same": 1,
+            "changed": 2,
+            "nested": {"keep": 1, "edit": 9, "gone": 0},
+            "removed": "x",
+        },
+        "left": {
+            "same": 1,
+            "changed": 2,
+            "nested": {"keep": 1, "edit": 9, "gone": 0},
+            "removed": "x",
+            "added_l": "L",
+        },
+        "right": {
+            "same": 1,
+            "changed": 3,
+            "nested": {"keep": 1, "edit": 10},
+        },
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["patch"] == [
+        {"op": "add", "path": "/added_l", "value": "L"},
+        {"op": "replace", "path": "/changed", "value": 3},
+        {"op": "replace", "path": "/nested/edit", "value": 10},
+        {"op": "remove", "path": "/nested/gone"},
+        {"op": "remove", "path": "/removed"},
+    ]
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_replaces_arrays_wholesale():
+    payload = {
+        "base": {"a": [1, 2, 3], "b": [1]},
+        "left": {"a": [1, 2, 3, 4], "b": [1]},
+        "right": {"a": [1, 2, 3], "b": [1, 2]},
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["patch"] == [
+        {"op": "replace", "path": "/a", "value": [1, 2, 3, 4]},
+        {"op": "replace", "path": "/b", "value": [1, 2]},
+    ]
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_escapes_json_pointer_tokens():
+    payload = {
+        "base": {"a/b": 1, "c~d": 2},
+        "left": {"a/b": 9, "c~d": 2, "e": 3},
+        "right": {"a/b": 1, "c~d": 2},
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["patch"] == [
+        {"op": "replace", "path": "/a~1b", "value": 9},
+        {"op": "add", "path": "/e", "value": 3},
+    ]
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_handles_additions_and_deletions():
+    payload = {
+        "base": {"keep": 1, "gone": 5},
+        "left": {"keep": 1, "gone": 5, "added": 7},
+        "right": {"keep": 1},  # deletes gone
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"keep": 1, "added": 7}
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+    remove_op = next(op for op in body["patch"] if op["op"] == "remove")
+    assert remove_op == {"op": "remove", "path": "/gone"}
+
+
+def test_patch_for_root_level_merged_document():
+    payload = {
+        "base": [1, 2],
+        "left": [1, 2, 3],
+        "right": [1, 2],
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == [1, 2, 3]
+    assert body["patch"] == [
+        {"op": "replace", "path": "", "value": [1, 2, 3]}
+    ]
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_reflects_conflict_resolutions():
+    payload = {
+        "base": {"a": 1, "b": 1},
+        "left": {"a": 2, "b": 2},
+        "right": {"a": 3, "b": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["merged"] == {"a": 3, "b": 1}
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+    assert body["patch"] == [
+        {"op": "replace", "path": "/a", "value": 3}
+    ]
+
+
+def test_patch_roundtrip_with_identity_arrays_and_protected_paths():
+    payload = {
+        "base": {
+            "servers": [
+                {"id": "a", "port": 8080, "secret": "s"},
+                {"id": "b", "port": 80},
+            ],
+        },
+        "left": {
+            "servers": [
+                {"id": "b", "port": 80},
+                {"id": "c", "port": 9000},
+            ],
+        },
+        "right": {
+            "servers": [
+                {"id": "a", "port": 8080, "secret": "rotated"},
+                {"id": "b", "port": 81},
+            ],
+        },
+        "arrayIdentity": {"/servers": "id"},
+        "protectedPaths": ["/servers/*/secret"],
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    # Item a frozen (protected secret), b edited by right, c added by left.
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+    # The array changed (item c appended) -> one wholesale array replace.
+    assert body["patch"] == [
+        {"op": "replace", "path": "/servers", "value": body["merged"]["servers"]}
+    ]
+
+
+def test_patch_roundtrip_with_provenance_enabled_too():
+    payload = {
+        "base": {"a": 1, "b": 2},
+        "left": {"a": 10, "b": 2},
+        "right": {"a": 1, "b": 20},
+        "includePatch": True,
+        "includeProvenance": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert set(body.keys()) == {"merged", "conflicts", "provenance", "patch"}
+    assert _rfc6902_apply(payload["base"], body["patch"]) == body["merged"]
+    assert [e["pointer"] for e in body["provenance"]] == ["/a", "/b"]
+
+
+def test_patch_toggle_does_not_change_merged_or_conflicts():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+    }
+    off = client.post("/merge", json=payload).json()
+    on = client.post("/merge", json={**payload, "includePatch": True}).json()
+    assert on["merged"] == off["merged"]
+    assert on["conflicts"] == off["conflicts"]
+
+
+def test_include_patch_must_be_boolean():
+    response = client.post(
+        "/merge",
+        json={
+            "base": 1, "left": 1, "right": 1,
+            "includePatch": ["please"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_patch_shape_validated_in_openapi_schema():
+    schema = client.get("/openapi.json").json()
+    req_props = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "includePatch" in req_props
+    patch_op = schema["components"]["schemas"]["PatchOperation"]
+    assert patch_op["required"] == ["op", "path"]
+    assert set(patch_op["properties"]["op"]["enum"]) == {
+        "add", "remove", "replace"
+    }
+    response_schema = schema["components"]["schemas"]["MergeResponse"]
+    assert "patch" not in response_schema["required"]
+    any_of = response_schema["properties"]["patch"]["anyOf"]
+    assert {"type": "null"} in any_of
+    assert any(spec.get("type") == "array" for spec in any_of)
+    assert response_schema["required"] == ["merged", "conflicts"]
+
+
 # ------------------------------------------------------------- size limiting
 
 

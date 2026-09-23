@@ -121,6 +121,22 @@ class MergeRequest(BaseModel):
             "emitted."
         ),
     )
+    include_patch: bool = Field(
+        default=False,
+        alias="includePatch",
+        description=(
+            "When true, the response includes a 'patch' array holding an "
+            "RFC 6902 JSON Patch. Applying the operations in order to the "
+            "request 'base' yields the response 'merged' exactly. Object "
+            "differences are represented recursively (add/remove/replace "
+            "per member); arrays differ as one wholesale 'replace' of the "
+            "whole array; operation paths are JSON Pointers (RFC 6901) "
+            "with '~' and '/' escaped as '~0' and '~1', and a "
+            "whole-document replacement uses the empty path. When false "
+            "(the default) the response shape is unchanged and no 'patch' "
+            "key is emitted."
+        ),
+    )
 
 
 class Conflict(BaseModel):
@@ -184,6 +200,38 @@ class ProvenanceEntry(BaseModel):
     )
 
 
+class PatchOperation(BaseModel):
+    """One JSON Patch (RFC 6902) operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["add", "remove", "replace"] = Field(
+        ...,
+        description=(
+            "The RFC 6902 operation kind. Object members are added, "
+            "removed or replaced individually; an array difference is a "
+            "single 'replace' carrying the whole new array."
+        ),
+    )
+    path: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the location within the request "
+            "'base' document; the empty string addresses the whole "
+            "document. Reference tokens escape '~' as '~0' and '/' as "
+            "'~1'."
+        ),
+    )
+    value: JsonValue = Field(
+        default=None,
+        description=(
+            "The value to add or replace. Present only for 'add' and "
+            "'replace' operations (including JSON null); absent entirely "
+            "from a 'remove' operation."
+        ),
+    )
+
+
 class MergeResponse(BaseModel):
     merged: JsonValue
     conflicts: list[Conflict]
@@ -194,5 +242,14 @@ class MergeResponse(BaseModel):
             "One entry per actual changed leaf or identity-array item in "
             "the final document, sorted by 'pointer'. Absent entirely from "
             "the response when provenance was not requested."
+        ),
+    )
+    patch: Optional[list[PatchOperation]] = Field(
+        default=None,
+        description=(
+            "Present only when the request set includePatch=true. An RFC "
+            "6902 JSON Patch (ordered add/remove/replace operations) that "
+            "turns the request 'base' into 'merged'. Absent entirely from "
+            "the response when the patch was not requested."
         ),
     )

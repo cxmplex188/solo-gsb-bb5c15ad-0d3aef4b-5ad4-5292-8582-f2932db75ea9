@@ -106,6 +106,18 @@ class RawProvenance(NamedTuple):
     deleted: bool
 
 
+class RawPatchOp(NamedTuple):
+    """One JSON Patch (RFC 6902) operation.
+
+    ``value`` is meaningful only for ``add`` / ``replace``; a ``remove``
+    op carries :data:`MISSING` there and renders no ``value`` member.
+    """
+
+    op: str  # "add" | "remove" | "replace"
+    path: str  # RFC 6901 JSON Pointer, "" being the whole document
+    value: Any = MISSING
+
+
 class _MergeResult(NamedTuple):
     """Artifacts of a full merge run, shared by the conflict and the
     provenance paths so both describe exactly the same final outcome."""
@@ -1763,6 +1775,64 @@ def parse_pointer(pointer: str) -> tuple[str, ...]:
 
 def escape_token(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
+
+
+def make_patch(base: Any, target: Any) -> list[RawPatchOp]:
+    """Build an RFC 6902 JSON Patch turning *base* into *target*.
+
+    Applying the returned operations to *base* in order yields a document
+    structurally equal (see :func:`json_equal`) to *target*. Object
+    differences are generated recursively: keys present only in *target*
+    are ``add``ed, keys present only in *base* are ``remove``d, and keys
+    present in both whose value differs are ``replace``d (or recursed into
+    when both values are objects). Arrays are never diffed element by
+    element: an array difference is a single ``replace`` of the whole
+    array, in line with the merge engine treating unconfigured arrays as
+    atomic values. Operation paths are JSON Pointers (RFC 6901) with
+    reference tokens escaped via :func:`escape_token`; a whole-document
+    replacement is one ``replace`` with path ``""``.
+
+    Object keys are visited in sorted order (adds, then changes, then
+    removals) so identical inputs produce identical operation lists; the
+    collected operations are finally sorted by pointer. That stays
+    applicable because operation paths are prefix-free: an added or
+    removed object is always one single op, never recursed into, so no
+    operation targets the parent of another.
+    """
+    ops: list[RawPatchOp] = []
+    _diff_values(base, target, (), ops)
+    ops.sort(key=lambda op: (op.path, op.op))
+    return ops
+
+
+def _diff_values(base: Any, target: Any, path: tuple[str, ...],
+                 ops: list[RawPatchOp]) -> None:
+    if json_equal(base, target):
+        return
+    # Recurse only when both sides are objects; arrays and type changes
+    # (object <-> array/scalar) are a single wholesale replacement.
+    if isinstance(base, dict) and isinstance(target, dict):
+        added = sorted(set(target) - set(base))
+        removed = sorted(set(base) - set(target))
+        common = sorted(set(base) & set(target))
+        for key in added:
+            ops.append(RawPatchOp("add", _render_pointer(path + (key,)),
+                                  target[key]))
+        for key in common:
+            _diff_values(base[key], target[key], path + (key,), ops)
+        for key in removed:
+            ops.append(RawPatchOp("remove", _render_pointer(path + (key,))))
+        return
+    # Leaf difference (scalar, array, or a type change): one wholesale
+    # replacement, at the root pointer for whole-document changes.
+    ops.append(RawPatchOp("replace", _render_pointer(path), target))
+
+
+def _render_pointer(path: tuple[str, ...]) -> str:
+    """Render object-key path tokens as an RFC 6901 JSON Pointer."""
+    if not path:
+        return ""
+    return "/" + "/".join(escape_token(str(step)) for step in path)
 
 
 def json_equal(a: Any, b: Any) -> bool:
