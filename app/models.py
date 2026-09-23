@@ -121,6 +121,52 @@ class MergeRequest(BaseModel):
             "emitted."
         ),
     )
+    include_patch: bool = Field(
+        default=False,
+        alias="includePatch",
+        description=(
+            "When true, the response additionally includes a 'patch' array "
+            "of JSON Patch operations (RFC 6902) that transform 'base' "
+            "into 'merged': applying the operations to base in order with "
+            "an RFC 6902 processor yields exactly merged. Object "
+            "differences are emitted recursively (add/remove/replace per "
+            "member), arrays are always replaced wholesale, and JSON "
+            "Pointer reference tokens are escaped per RFC 6901 ('~' -> "
+            "'~0', '/' -> '~1'). When false (the default) the response "
+            "shape is unchanged and no 'patch' key is emitted."
+        ),
+    )
+
+
+class PatchOperation(BaseModel):
+    """One RFC 6902 JSON Patch operation transforming base into merged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["add", "remove", "replace"] = Field(
+        ...,
+        description=(
+            "RFC 6902 operation kind: 'add' (including new object members "
+            "and a freshly added object subtree, added as {} first), "
+            "'remove' (a dropped object member or subtree), 'replace' (a "
+            "changed leaf value or an array replaced wholesale)."
+        ),
+    )
+    path: str = Field(
+        ...,
+        description=(
+            "JSON Pointer (RFC 6901) of the operation's target location. "
+            "Reference tokens are escaped ('~' -> '~0', '/' -> '~1'); the "
+            "empty string targets the whole document (root replacement)."
+        ),
+    )
+    value: JsonValue = Field(
+        default=None,
+        description=(
+            "The new value for 'add' and 'replace' operations. Omitted "
+            "entirely from 'remove' operations."
+        ),
+    )
 
 
 class Conflict(BaseModel):
@@ -194,5 +240,16 @@ class MergeResponse(BaseModel):
             "One entry per actual changed leaf or identity-array item in "
             "the final document, sorted by 'pointer'. Absent entirely from "
             "the response when provenance was not requested."
+        ),
+    )
+    patch: Optional[list[PatchOperation]] = Field(
+        default=None,
+        description=(
+            "Present only when the request set includePatch=true. Ordered "
+            "RFC 6902 JSON Patch operations that turn 'base' into "
+            "'merged'. Objects differ field by field, arrays are replaced "
+            "wholesale, and JSON Pointer tokens follow RFC 6901 escaping. "
+            "Absent entirely from the response when the patch was not "
+            "requested."
         ),
     )

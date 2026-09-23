@@ -259,6 +259,84 @@ curl -s -X POST http://localhost:8000/merge \
 下标 `0`，也显示为 `/servers/0`（`deleted: false`）——两条记录按指针相邻排列。
 被接受的删除同样可以来自裁决（此时 `source` 为裁决方且 `adjudicated: true`）。
 
+### JSON Patch（includePatch）
+
+审阅或落地合并结果时，除了 `merged` 文档本身，还可能需要一份**把请求 `base` 变成
+`merged` 的操作序列**。请求可携带可选布尔字段 `includePatch`（也接受别名
+`include_patch`，默认 `false`）。开启后，响应在 `merged` / `conflicts`（以及可能的
+`provenance`）之外**新增**一个 `patch` 数组；不开启时**响应格式完全不变**（不会出现
+`"patch": null`，连键都不存在）。
+
+`patch` 是一组 [JSON Patch (RFC 6902)](https://www.rfc-editor.org/rfc/rfc6902) 操作，
+**按顺序应用到请求的 `base` 上，结果必须恰好等于响应的 `merged`**：
+
+- **对象差异递归生成操作**：字段级 `add` / `remove` / `replace`，互不影响的字段各自独立；
+  新增的对象子树先 `add` 一个空对象 `{}`，再逐字段 `add`，保证每条操作执行时其父对象已经存在；
+  删除整个对象子树只需一条 `remove`；
+- **数组作为整体替换**：无论普通数组还是经 `arrayIdentity` 逐项合并的身份数组，patch 都
+  只产出一条针对整条数组的 `replace`（数组新增 / 删除同理，为整条 `add` / `remove`），
+  绝不逐元素改下标；
+- 标量变化、`null` 与其他值互改、对象与数组类型互换都用一条 `replace`；根文档本身被
+  替换时 `path` 为空字符串 `""`；
+- **JSON Pointer token 按 RFC 6901 转义**：`~` → `~0`，`/` → `~1`（对象成员按键排序遍历，
+  依据是**原始未转义**键名，因此操作顺序确定）；
+- 操作只描述最终的 `base → merged`：未裁决冲突保留 base 时对应位置**不产生操作**；
+  冲突经 `conflictResolutions` 裁决、`protectedPaths` 冻结等结果同样如实体现在 patch 中；
+  `redactPaths` 只脱敏 `conflicts`，patch 始终基于真实的 `merged` 构建，不含 `[REDACTED]`；
+- `merged` 与 `base` 完全相等时 `patch` 为 `[]`。该选项可与 `includeProvenance` 同时开启。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {
+      "name": "demo",
+      "db": {"host": "a", "port": 5432, "pool": 5},
+      "tags": ["blue", "green"]
+    },
+    "left": {
+      "name": "demo",
+      "db": {"host": "b", "port": 5432, "pool": 5, "tls": {"enabled": true}},
+      "tags": ["blue", "green", "red"]
+    },
+    "right": {
+      "name": "demo",
+      "db": {"host": "a", "port": 5433, "pool": 5},
+      "tags": ["blue", "green"]
+    },
+    "includePatch": true
+  }'
+```
+
+响应（`db/host` 取 left、`db/port` 取 right、新增的 `db/tls` 对象先建空对象再补字段、
+`tags` 数组整体替换；未变更的 `name` 与 `db/pool` 不产生操作）：
+
+```json
+{
+  "merged": {
+    "name": "demo",
+    "db": {"host": "b", "port": 5433, "pool": 5, "tls": {"enabled": true}},
+    "tags": ["blue", "green", "red"]
+  },
+  "conflicts": [],
+  "patch": [
+    {"op": "replace", "path": "/db/host", "value": "b"},
+    {"op": "replace", "path": "/db/port", "value": 5433},
+    {"op": "add", "path": "/db/tls", "value": {}},
+    {"op": "add", "path": "/db/tls/enabled", "value": true},
+    {"op": "replace", "path": "/tags", "value": ["blue", "green", "red"]}
+  ]
+}
+```
+
+`remove` 操作按 RFC 6902 不携带 `value`，例如两侧都删除 `/old` 字段时：
+
+```json
+{"op": "remove", "path": "/old"}
+```
+
 ### 对象数组与身份字段
 
 在 `arrayIdentity` 中声明“数组指针 → 身份字段名”：
@@ -280,7 +358,10 @@ curl -s -X POST http://localhost:8000/merge \
 `protectedPaths`（也接受别名 `protected_paths`）为受保护指针数组，可省略；
 `redactPaths`（也接受别名 `redact_paths`）为冲突值脱敏指针数组，可省略；
 `includeProvenance`（也接受别名 `include_provenance`）为布尔值，可省略（默认 `false`），
-开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）。
+开启后响应额外返回按最终指针排序的 `provenance` 数组（见“合并溯源”一节）；
+`includePatch`（也接受别名 `include_patch`）为布尔值，可省略（默认 `false`），
+开启后响应额外返回一组按顺序把 `base` 变成 `merged` 的 RFC 6902 `patch` 操作
+（见“JSON Patch”一节），可与 `includeProvenance` 同时开启。
 
 请求：
 
@@ -467,10 +548,11 @@ pytest -q
 app/
   main.py         FastAPI 路由（/health、/merge）
   merger.py       三方合并引擎（JSON Pointer、身份数组、冲突建模）
+  patch.py        RFC 6902 JSON Patch 生成（对象递归、数组整体替换、token 转义）
   middleware.py   请求体大小上限 ASGI 中间件
   config.py       环境变量配置与大小解析
   models.py       请求/响应 Pydantic 模型
-tests/            引擎与 HTTP 层测试（pytest）
+tests/            引擎与 HTTP 层测试（pytest，含 patch 往返与随机性质测试）
 Dockerfile        精简镜像（python:3.12-slim，非 root，内置 HEALTHCHECK）
 docker-compose.yml 一键启动
 ```

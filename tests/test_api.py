@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 os.environ.setdefault("MAX_REQUEST_SIZE_BYTES", "10M")
@@ -13,6 +14,12 @@ from starlette.requests import Request
 
 from app.main import app
 from app.middleware import RequestSizeLimitMiddleware
+from tests.test_patch import apply_json_patch
+
+
+def apply_patch(document, operations):
+    """Apply an RFC 6902 patch from an API response (plain JSON values)."""
+    return apply_json_patch(document, operations)
 
 
 client = TestClient(app)
@@ -1151,6 +1158,322 @@ def test_provenance_entry_shape_is_validated_in_schema():
     assert {"type": "null"} in any_of
     assert any(spec.get("type") == "array" for spec in any_of)
     # Only merged and conflicts are required at the envelope level.
+    assert response_schema["required"] == ["merged", "conflicts"]
+
+
+# --------------------------------------------------------------- includePatch
+
+
+def test_patch_absent_from_response_by_default():
+    response = client.post(
+        "/merge",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1}},
+    )
+    assert response.status_code == 200
+    # The legacy envelope is unchanged: no patch key at all.
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_patch_absent_when_explicitly_false():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "includePatch": False,
+        },
+    )
+    assert response.status_code == 200
+    assert set(response.json().keys()) == {"merged", "conflicts"}
+
+
+def test_patch_accepts_snake_case_alias():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "include_patch": True,
+        },
+    )
+    assert response.status_code == 200
+    assert "patch" in response.json()
+
+
+def test_patch_is_empty_when_nothing_changed():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 1}, "right": {"a": 1},
+            "includePatch": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["patch"] == []
+
+
+def test_patch_rebuilds_merged_for_mixed_object_changes():
+    payload = {
+        "base": {
+            "keep": 0,
+            "scalar": 1,
+            "gone": {"x": [1, 2]},
+            "o": {"a": 1, "b": 2},
+        },
+        "left": {
+            "keep": 0,
+            "scalar": 10,
+            "added": {"deep": [9]},
+            "o": {"a": 11, "b": 2},
+        },
+        "right": {
+            "keep": 0,
+            "scalar": 1,
+            "o": {"a": 1, "b": 20, "c": 3},
+        },
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["conflicts"] == []
+    # Operations walk raw object keys in sorted order at each object level.
+    assert body["patch"] == [
+        {"op": "add", "path": "/added", "value": {}},
+        {"op": "add", "path": "/added/deep", "value": [9]},
+        {"op": "remove", "path": "/gone"},
+        {"op": "replace", "path": "/o/a", "value": 11},
+        {"op": "replace", "path": "/o/b", "value": 20},
+        {"op": "add", "path": "/o/c", "value": 3},
+        {"op": "replace", "path": "/scalar", "value": 10},
+    ]
+    assert apply_patch(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_for_unresolved_conflict_keeps_base_and_is_empty():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+            "includePatch": True,
+        },
+    )
+    body = response.json()
+    assert body["merged"] == {"a": 1}
+    assert len(body["conflicts"]) == 1
+    # merged equals base, so the patch is an empty no-op sequence.
+    assert body["patch"] == []
+
+
+def test_patch_reflects_conflict_adjudication():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+            "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+            "includePatch": True,
+        },
+    )
+    body = response.json()
+    assert body["merged"] == {"a": 3}
+    assert body["patch"] == [
+        {"op": "replace", "path": "/a", "value": 3}
+    ]
+    assert apply_patch({"a": 1}, body["patch"]) == body["merged"]
+
+
+def test_patch_replaces_plain_arrays_wholesale():
+    payload = {
+        "base": {"arr": [1, 2, 3]},
+        "left": {"arr": [1, 2, 4, 5]},
+        "right": {"arr": [1, 2, 3]},
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["patch"] == [
+        {"op": "replace", "path": "/arr", "value": [1, 2, 4, 5]}
+    ]
+    assert apply_patch(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_replaces_identity_array_wholesale():
+    # Identity merging itemizes the array internally, but the RFC 6902 patch
+    # still treats arrays atomically: one 'replace' of the whole array.
+    payload = {
+        "base": {"servers": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]},
+        "left": {"servers": [{"id": "b", "v": 1}]},  # deletes a
+        "right": {"servers": [
+            {"id": "a", "v": 1},
+            {"id": "b", "v": 8},
+            {"id": "c", "v": 3},
+        ]},
+        "arrayIdentity": {"/servers": "id"},
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    assert body["conflicts"] == []
+    assert body["patch"] == [
+        {
+            "op": "replace",
+            "path": "/servers",
+            "value": [
+                {"id": "b", "v": 8},
+                {"id": "c", "v": 3},
+            ],
+        }
+    ]
+    assert apply_patch(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_escapes_pointer_tokens():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a/b": 1, "~t": 2},
+            "left": {"a/b": 9, "~t": 2, "new~k": 5},
+            "right": {"a/b": 1, "~t": 2},
+            "includePatch": True,
+        },
+    )
+    body = response.json()
+    assert body["patch"] == [
+        {"op": "replace", "path": "/a~1b", "value": 9},
+        {"op": "add", "path": "/new~0k", "value": 5},
+    ]
+    assert apply_patch({"a/b": 1, "~t": 2}, body["patch"]) == body["merged"]
+
+
+def test_patch_root_level_replacement():
+    response = client.post(
+        "/merge",
+        json={"base": [1, 2], "left": [1, 2, 3], "right": [1, 2],
+              "includePatch": True},
+    )
+    body = response.json()
+    assert body["patch"] == [
+        {"op": "replace", "path": "", "value": [1, 2, 3]}
+    ]
+    assert apply_patch([1, 2], body["patch"]) == body["merged"]
+
+
+def test_patch_removed_object_subtree_is_one_operation():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"o": {"x": 1}}, "left": {}, "right": {},
+            "includePatch": True,
+        },
+    )
+    body = response.json()
+    assert body["patch"] == [{"op": "remove", "path": "/o"}]
+    assert apply_patch({"o": {"x": 1}}, body["patch"]) == body["merged"]
+
+
+def test_patch_redaction_does_not_leak_or_change_patch():
+    payload = {
+        "base": {"a": 1, "pw": "x"},
+        "left": {"a": 2, "pw": "L"},
+        "right": {"a": 3, "pw": "R"},
+        "redactPaths": ["/pw"],
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+        "includePatch": True,
+    }
+    body = client.post("/merge", json=payload).json()
+    # Conflicts are masked...
+    pw_conflict = next(c for c in body["conflicts"] if c["pointer"] == "/pw")
+    assert pw_conflict["base"] == "[REDACTED]"
+    # ...the patch is built from the true merged document (/a adjudicated,
+    # /pw frozen at base) and carries no redaction marker.
+    assert body["merged"] == {"a": 3, "pw": "x"}
+    assert body["patch"] == [{"op": "replace", "path": "/a", "value": 3}]
+    serialized = json.dumps(body["patch"])
+    assert "[REDACTED]" not in serialized
+    assert apply_patch(payload["base"], body["patch"]) == body["merged"]
+
+
+def test_patch_and_provenance_can_be_requested_together():
+    response = client.post(
+        "/merge",
+        json={
+            "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 1},
+            "includePatch": True, "includeProvenance": True,
+        },
+    )
+    body = response.json()
+    assert set(body.keys()) == {"merged", "conflicts", "provenance", "patch"}
+    assert body["patch"] == [{"op": "replace", "path": "/a", "value": 2}]
+    assert body["provenance"] == [
+        {"pointer": "/a", "source": "left",
+         "adjudicated": False, "deleted": False}
+    ]
+
+
+def test_patch_toggle_does_not_change_merged_or_conflicts():
+    payload = {
+        "base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3},
+        "conflictResolutions": [{"pointer": "/a", "resolution": "right"}],
+    }
+    off = client.post("/merge", json=payload).json()
+    on = client.post("/merge", json={**payload, "includePatch": True}).json()
+    assert on["merged"] == off["merged"]
+    assert on["conflicts"] == off["conflicts"]
+
+
+def test_patch_roundtrip_over_all_engine_fixtures():
+    # Property-style guarantee over a spread of merge scenarios: applying
+    # the reported patch to the request base always yields reported merged.
+    scenarios = [
+        # one-sided edits, identical edits, deletions
+        ({"a": 1, "b": 2}, {"a": 10}, {"b": 20}, {}),
+        ({"a": 1}, {}, {}, {}),
+        # unresolved conflict keeps base; adjudicated conflict takes right
+        ({"a": 1, "b": 1}, {"a": 2, "b": 2}, {"a": 3, "b": 3},
+         {"conflictResolutions": [{"pointer": "/a", "resolution": "right"}]}),
+        # nested objects and added subtrees
+        ({"o": {"x": 1}}, {"o": {"x": 1, "y": {"z": 2}}}, {"o": {"x": 1}}, {}),
+        # null values and type changes
+        ({"a": 1, "b": []}, {"a": None, "b": {}}, {"a": 1, "b": []}, {}),
+        # plain array wholesale
+        ({"a": [1, 2]}, {"a": [9]}, {"a": [1, 2]}, {}),
+        # identity array
+        ({"s": [{"id": "a"}, {"id": "b"}]},
+         {"s": [{"id": "b"}, {"id": "c"}]},
+         {"s": [{"id": "a", "v": 1}, {"id": "b"}]},
+         {"arrayIdentity": {"/s": "id"}}),
+        # escaped keys
+        ({"a/b": {"~": 1}}, {"a/b": {"~": 2}}, {"a/b": {"~": 1}}, {}),
+    ]
+    for base, left, right, options in scenarios:
+        payload = {"base": base, "left": left, "right": right,
+                   "includePatch": True, **options}
+        body = client.post("/merge", json=payload).json()
+        assert apply_patch(base, body["patch"]) == body["merged"]
+
+
+def test_include_patch_must_be_boolean():
+    response = client.post(
+        "/merge",
+        json={
+            "base": 1, "left": 1, "right": 1,
+            "includePatch": ["please"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_patch_operation_shape_is_validated_in_schema():
+    schema = client.get("/openapi.json").json()
+    req_props = schema["components"]["schemas"]["MergeRequest"]["properties"]
+    assert "includePatch" in req_props
+    operation = schema["components"]["schemas"]["PatchOperation"]
+    assert operation["required"] == ["op", "path"]
+    assert set(operation["properties"]["op"]["enum"]) == {
+        "add", "remove", "replace"
+    }
+    response_schema = schema["components"]["schemas"]["MergeResponse"]
+    # patch is optional (not required) and accepts an array or null.
+    assert "patch" not in response_schema["required"]
+    response_props = response_schema["properties"]
+    assert "patch" in response_props
+    any_of = response_props["patch"]["anyOf"]
+    assert {"type": "null"} in any_of
+    assert any(spec.get("type") == "array" for spec in any_of)
     assert response_schema["required"] == ["merged", "conflicts"]
 
 

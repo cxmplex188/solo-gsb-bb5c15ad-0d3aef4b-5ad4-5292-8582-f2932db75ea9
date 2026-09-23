@@ -14,6 +14,7 @@ from .models import (
     MergeResponse,
     ProvenanceEntry,
 )
+from .patch import build_json_patch
 
 app = FastAPI(
     title="Three-way JSON Merge API",
@@ -39,10 +40,15 @@ app = FastAPI(
         "(base, left, right, merged), whether a conflict adjudication "
         "produced it, and whether it was deleted; records are sorted by "
         "final JSON Pointer (deleted items keep their original pointer). "
+        "With 'includePatch' the response additionally carries a 'patch' "
+        "array of RFC 6902 JSON Patch operations that turn the request "
+        "'base' into the response 'merged' when applied in order: object "
+        "differences are emitted recursively, arrays are replaced "
+        "wholesale, and reference tokens follow RFC 6901 escaping. "
         "Without redaction the response conflicts always keep the original "
         "three-way values."
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 app.add_middleware(
     RequestSizeLimitMiddleware,
@@ -173,13 +179,16 @@ async def merge(request: MergeRequest):
         for record in raw_provenance
     ] if request.include_provenance else None
 
-    # Serialize directly: with provenance disabled the response must be
-    # byte-for-byte the old two-key envelope (no "provenance": null), while
-    # an enabled request always includes the array, even when empty.
+    # Serialize directly: with the optional toggles off the response must be
+    # byte-for-byte the old two-key envelope (no "provenance": null /
+    # "patch": null), while an enabled request always includes the matching
+    # key, even when its array is empty.
+    body: dict = {
+        "merged": merged,
+        "conflicts": [c.model_dump() for c in conflicts],
+    }
     if request.include_provenance:
-        body = MergeResponse(
-            merged=merged, conflicts=conflicts, provenance=provenance
-        ).model_dump()
-    else:
-        body = {"merged": merged, "conflicts": [c.model_dump() for c in conflicts]}
+        body["provenance"] = [entry.model_dump() for entry in provenance]
+    if request.include_patch:
+        body["patch"] = build_json_patch(request.base, merged)
     return JSONResponse(body)
